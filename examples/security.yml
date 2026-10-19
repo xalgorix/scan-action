@@ -1,0 +1,34 @@
+# Copy this to .github/workflows/security.yml in your repository.
+#
+# Runs a Xalgorix autonomous pentest on every pull request and fails the check
+# when a finding at/above `fail-on` is proven. Xalgorix is a DAST engine: it
+# scans a LIVE, internet-reachable URL — not the PR's code — so point `target`
+# at a deployed environment (your staging, or the PR's preview deployment).
+name: security
+
+on:
+  pull_request:
+    branches: [main]
+
+# If the PR is pushed again, cancel the previous (long) scan.
+concurrency:
+  group: xalgorix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  xalgorix:
+    runs-on: ubuntu-latest
+    # Secrets are NOT available to pull requests opened from forks, so the scan
+    # only runs on branches in this repo. Drop this line if that's not a concern.
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - name: Xalgorix security scan
+        # Pin to a commit SHA for supply-chain safety once you've reviewed it,
+        # e.g. @<40-char-sha>. `@v1` tracks the latest v1 release.
+        uses: xalgorix/scan-action@v1
+        with:
+          api-key: ${{ secrets.XALGORIX_API_KEY }}
+          target: https://staging.example.com # a publicly reachable deployed env
+          mode: single # single | wildcard
+          fail-on: high # none | low | medium | high | critical
+          timeout-minutes: 60

@@ -1,0 +1,194 @@
+name: "Xalgorix Scan"
+description: "Run a Xalgorix autonomous pentest against a target and optionally fail the build on findings."
+author: "Xalgorix"
+branding:
+  icon: "shield"
+  color: "green"
+
+inputs:
+  api-key:
+    description: "Xalgorix API key (xlg_live_…). Store it as a repository secret."
+    required: true
+  target:
+    description: "Target URL or host to scan (e.g. https://staging.example.com)."
+    required: true
+  mode:
+    description: "Scan mode: single or wildcard."
+    required: false
+    default: "single"
+  severity-filter:
+    description: "Minimum severity to report: info | low | medium | high | critical."
+    required: false
+    default: "low"
+  fail-on:
+    description: "Fail the job if a finding at/above this severity is found: none | low | medium | high | critical."
+    required: false
+    default: "high"
+  wait:
+    description: "Wait for the scan to finish (true) or return immediately after queuing (false)."
+    required: false
+    default: "true"
+  poll-interval:
+    description: "Seconds between status polls while waiting."
+    required: false
+    default: "20"
+  timeout-minutes:
+    description: "Give up waiting after this many minutes."
+    required: false
+    default: "60"
+  base-url:
+    description: "Xalgorix base URL (override for self-hosted / staging)."
+    required: false
+    default: "https://www.xalgorix.com"
+
+outputs:
+  scan-id:
+    description: "The created scan's id."
+    value: ${{ steps.scan.outputs.scan-id }}
+  status:
+    description: "Final scan status (completed | failed | stopped | running)."
+    value: ${{ steps.scan.outputs.status }}
+  web-url:
+    description: "Dashboard URL for the scan."
+    value: ${{ steps.scan.outputs.web-url }}
+  critical:
+    description: "Number of critical findings."
+    value: ${{ steps.scan.outputs.critical }}
+  high:
+    description: "Number of high findings."
+    value: ${{ steps.scan.outputs.high }}
+  medium:
+    description: "Number of medium findings."
+    value: ${{ steps.scan.outputs.medium }}
+  low:
+    description: "Number of low findings."
+    value: ${{ steps.scan.outputs.low }}
+  info:
+    description: "Number of info findings."
+    value: ${{ steps.scan.outputs.info }}
+
+runs:
+  using: "composite"
+  steps:
+    - id: scan
+      shell: bash
+      env:
+        XALGORIX_API_KEY: ${{ inputs.api-key }}
+        INPUT_TARGET: ${{ inputs.target }}
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_SEVERITY_FILTER: ${{ inputs.severity-filter }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_WAIT: ${{ inputs.wait }}
+        INPUT_POLL_INTERVAL: ${{ inputs.poll-interval }}
+        INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+        INPUT_BASE_URL: ${{ inputs.base-url }}
+      run: |
+        set -euo pipefail
+
+        if ! command -v jq >/dev/null 2>&1; then
+          echo "::error::jq is required but not installed on this runner."
+          exit 1
+        fi
+
+        BASE="${INPUT_BASE_URL%/}"
+
+        echo "::group::Queueing Xalgorix scan"
+        create_resp="$(curl -sS -X POST "$BASE/api/public/v1/scans" \
+          -H "Authorization: Bearer $XALGORIX_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -nc \
+                --arg t "$INPUT_TARGET" \
+                --arg m "$INPUT_MODE" \
+                --arg s "$INPUT_SEVERITY_FILTER" \
+                '{target:$t, mode:$m, severity_filter:$s}')" \
+          -w $'\n%{http_code}')"
+        http_code="$(printf '%s' "$create_resp" | tail -n1)"
+        body="$(printf '%s' "$create_resp" | sed '$d')"
+
+        if [ "$http_code" != "202" ]; then
+          echo "::error::Scan create failed (HTTP $http_code): $(printf '%s' "$body" | jq -r '.error // .detail // .' 2>/dev/null || printf '%s' "$body")"
+          exit 1
+        fi
+
+        scan_id="$(printf '%s' "$body" | jq -r '.id')"
+        web_url="$(printf '%s' "$body" | jq -r '.web_url')"
+        status_url="$(printf '%s' "$body" | jq -r '.status_url')"
+        echo "Scan queued: $scan_id"
+        echo "Dashboard:   $web_url"
+        echo "scan-id=$scan_id" >> "$GITHUB_OUTPUT"
+        echo "web-url=$web_url" >> "$GITHUB_OUTPUT"
+        echo "::endgroup::"
+
+        # Defaults in case we don't wait.
+        status="running"
+        crit=0; high=0; med=0; low=0; info=0
+
+        if [ "$INPUT_WAIT" = "true" ]; then
+          echo "::group::Waiting for scan to finish"
+          deadline=$(( $(date +%s) + INPUT_TIMEOUT_MINUTES * 60 ))
+          while :; do
+            sleep "$INPUT_POLL_INTERVAL"
+            poll="$(curl -sS "$status_url" -H "Authorization: Bearer $XALGORIX_API_KEY")"
+            status="$(printf '%s' "$poll" | jq -r '.scan.status // "unknown"')"
+            crit="$(printf '%s' "$poll" | jq -r '.counts.critical // 0')"
+            high="$(printf '%s' "$poll" | jq -r '.counts.high // 0')"
+            med="$(printf '%s' "$poll" | jq -r '.counts.medium // 0')"
+            low="$(printf '%s' "$poll" | jq -r '.counts.low // 0')"
+            info="$(printf '%s' "$poll" | jq -r '.counts.info // 0')"
+            phase="$(printf '%s' "$poll" | jq -r '.scan.current_phase // 0')"
+            echo "status=$status phase=$phase/22 · C:$crit H:$high M:$med L:$low"
+            case "$status" in
+              completed|failed|stopped) break ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Timed out after ${INPUT_TIMEOUT_MINUTES}m waiting for scan $scan_id."
+              status="timeout"
+              break
+            fi
+          done
+          echo "::endgroup::"
+        fi
+
+        {
+          echo "status=$status"
+          echo "critical=$crit"
+          echo "high=$high"
+          echo "medium=$med"
+          echo "low=$low"
+          echo "info=$info"
+        } >> "$GITHUB_OUTPUT"
+
+        # Job summary.
+        {
+          echo "## Xalgorix scan — $status"
+          echo ""
+          echo "| Severity | Count |"
+          echo "|----------|-------|"
+          echo "| Critical | $crit |"
+          echo "| High     | $high |"
+          echo "| Medium   | $med |"
+          echo "| Low      | $low |"
+          echo "| Info     | $info |"
+          echo ""
+          echo "[View full report]($web_url)"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$status" = "timeout" ]; then exit 1; fi
+
+        # Gate the build on severity.
+        gate=0
+        case "$INPUT_FAIL_ON" in
+          none)     gate=0 ;;
+          low)      gate=$(( crit + high + med + low )) ;;
+          medium)   gate=$(( crit + high + med )) ;;
+          high)     gate=$(( crit + high )) ;;
+          critical) gate=$(( crit )) ;;
+          *)        gate=$(( crit + high )) ;;
+        esac
+
+        if [ "$INPUT_FAIL_ON" != "none" ] && [ "$gate" -gt 0 ]; then
+          echo "::error::Xalgorix found $gate finding(s) at/above '$INPUT_FAIL_ON'. Failing the build."
+          exit 1
+        fi
+
+        echo "Xalgorix scan gate passed (fail-on=$INPUT_FAIL_ON)."
